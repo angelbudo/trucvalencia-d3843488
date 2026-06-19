@@ -24,6 +24,7 @@ interface Row {
   created_at: string;
   sender_name?: string | null;
   device_id?: string | null;
+  status?: string | null;
 }
 
 const MAX_MESSAGES = 50;
@@ -55,6 +56,7 @@ export function useRoomTextChat(roomId: string | null) {
         .from("room_text_chat")
         .select("*")
         .eq("room_id", roomId)
+        .neq("status", "blocked")
         .gte("created_at", sinceIso)
         .order("created_at", { ascending: true })
         .limit(MAX_MESSAGES)
@@ -64,7 +66,10 @@ export function useRoomTextChat(roomId: string | null) {
           setMessages((prev) => {
             const byId = new Map<number, RoomTextMessage>();
             for (const m of prev) byId.set(m.id, m);
-            for (const r of data) byId.set(r.id, toMsg(r));
+            for (const r of data) {
+              if (r.status === "blocked") { byId.delete(r.id); continue; }
+              byId.set(r.id, toMsg(r));
+            }
             return Array.from(byId.values())
               .filter((m) => m.createdAt >= cutoff)
               .sort((a, b) => a.createdAt - b.createdAt)
@@ -109,7 +114,9 @@ export function useRoomTextChat(roomId: string | null) {
           { event: "INSERT", schema: "public", table: "room_text_chat", filter: `room_id=eq.${roomId}` },
           (payload) => {
             if (cancelled) return;
-            const msg = toMsg(payload.new as Row);
+            const row = payload.new as Row;
+            if (row.status === "blocked") return;
+            const msg = toMsg(row);
             // Mostra el missatge instantàniament: les partides online no
             // han de tenir cap retard de cua entre missatges humans.
             setMessages((prev) => {
@@ -117,6 +124,18 @@ export function useRoomTextChat(roomId: string | null) {
               const next = [...prev, msg];
               return next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next;
             });
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "room_text_chat", filter: `room_id=eq.${roomId}` },
+          (payload) => {
+            if (cancelled) return;
+            const row = payload.new as Row;
+            // La IA ha vetado el mensaje → desaparece de todas las pantallas.
+            if (row.status === "blocked") {
+              setMessages((prev) => prev.filter((m) => m.id !== row.id));
+            }
           },
         )
         .subscribe((status) => {
