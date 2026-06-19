@@ -410,7 +410,7 @@ export function BoardRoomChat({
                           )}
                           :
                         </span>
-                        <span className={cn("break-words", isSpectatorMsg ? "text-background/80" : "text-background")}>{filterProfanity(m.text)}</span>
+                        <span className={cn("break-words", isSpectatorMsg ? "text-background/80" : "text-background")}>{filterProfanity(m.text, String(m.id))}</span>
                       </div>
                       {!isMine && !isSpectatorMsg && (
                         <button

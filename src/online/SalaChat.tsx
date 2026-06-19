@@ -106,7 +106,7 @@ export function SalaChat({ salaSlug, deviceId, name, hasName, headerExtra, class
                       }
                     />
                   )}
-                  <span className="text-background break-words">{filterProfanity(m.text)}</span>
+                  <span className="text-background break-words">{filterProfanity(m.text, String(m.id))}</span>
                 </div>
                 {!isMine && (
                   <Link

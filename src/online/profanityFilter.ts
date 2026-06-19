@@ -72,11 +72,23 @@ const MASK_WITH_GAME_WORD = new Set<string>([
 ]);
 
 const GAME_REPLACEMENTS = ["¡Xe!", "¡Redeu!", "¡Recoranta!", "¡Reganxet!", "¡Che!"];
-let _gameIdx = 0;
-function nextGameWord(): string {
-  const w = GAME_REPLACEMENTS[_gameIdx % GAME_REPLACEMENTS.length];
-  _gameIdx += 1;
-  return w;
+
+function stringHash(str: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h;
+}
+
+function seededRandom(seed: string): number {
+  return (stringHash(seed) % 100000) / 100000;
+}
+
+function getGameWordForSeed(seed: string): string {
+  const idx = Math.floor(seededRandom(seed) * GAME_REPLACEMENTS.length);
+  return GAME_REPLACEMENTS[idx % GAME_REPLACEMENTS.length];
 }
 
 function stripDiacritics(s: string): string {
@@ -157,13 +169,13 @@ export function loadBlacklistFromSupabase(): Promise<void> {
  * s'aplica sobre la versió sense diacrítics, però es preserva la posició
  * i els caràcters de separació originals.
  */
-export function filterProfanity(text: string): string {
+export function filterProfanity(text: string, seed?: string): string {
   if (!text) return text;
   let out = text;
   for (const { raw, rx } of PATTERNS) {
     out = out.replace(rx, (_match, pre: string, hit: string) => {
       const replacement = MASK_WITH_GAME_WORD.has(raw)
-        ? nextGameWord()
+        ? getGameWordForSeed(seed ? `${seed}:${raw}` : raw)
         : "*".repeat(Math.max(3, hit.length));
       return `${pre}${replacement}`;
     });
