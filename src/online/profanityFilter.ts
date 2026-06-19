@@ -54,17 +54,24 @@ const DEFAULT_BAD_WORDS: string[] = [
   "amaricat",
 ];
 
-/** Paraules "lleus" que substituirem per una expressió del joc en lloc d'asteriscs. */
+/**
+ * Només interjeccions/exclamacions lleus es substitueixen per una
+ * expressió del Truc. Els insults greus i obscenitats (puta, polla,
+ * gilipollas, cabron, maricon, zorra, fillputa, etc.) cauen sempre a
+ * la branca d'asteriscs perquè no tenen sentit com a exclamació.
+ */
 const MASK_WITH_GAME_WORD = new Set<string>([
+  // Castellà — exclamacions
   "joder", "jodete",
-  "mierda", "merda", "merdes", "mierdas",
+  "mierda", "mierdas",
   "coño", "cono",
-  "collons", "carall", "punyeta", "punyetes",
-  "tonto", "tonta", "ximple", "ximplos", "panoli",
-  "idiota", "idiotas", "estupido", "estupida", "estupit",
+  // Valencià / català — exclamacions
+  "merda", "merdes",
+  "collons", "carall",
+  "punyeta", "punyetes",
 ]);
 
-const GAME_REPLACEMENTS = ["¡Xe!", "¡Redeu!", "¡Recoranta!", "¡Reganxet!"];
+const GAME_REPLACEMENTS = ["¡Xe!", "¡Redeu!", "¡Recoranta!", "¡Reganxet!", "¡Che!"];
 let _gameIdx = 0;
 function nextGameWord(): string {
   const w = GAME_REPLACEMENTS[_gameIdx % GAME_REPLACEMENTS.length];
