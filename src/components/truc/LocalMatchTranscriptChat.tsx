@@ -126,7 +126,7 @@ export function LocalMatchTranscriptChat({
                           {senderName}:
                         </span>
                         <span className="break-words text-table-felt">
-                          {filterProfanity(m.text ?? phraseText(m.phraseId, m.vars))}
+                          {filterProfanity(m.text ?? phraseText(m.phraseId, m.vars), m.id)}
                         </span>
                       </div>
                     </div>
