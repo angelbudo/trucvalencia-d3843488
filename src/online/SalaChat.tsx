@@ -8,6 +8,7 @@ import { useSalaChat, sendSalaChat, type SalaChatMessage } from "@/online/useSal
 import { getSalaName } from "@/pages/online/Sales";
 import { useT } from "@/i18n/useT";
 import { PlayerProfileDialog } from "@/online/PlayerProfileDialog";
+import { filterProfanity } from "@/online/profanityFilter";
 
 const MAX_LEN = 200;
 
@@ -105,7 +106,7 @@ export function SalaChat({ salaSlug, deviceId, name, hasName, headerExtra, class
                       }
                     />
                   )}
-                  <span className="text-background break-words">{m.text}</span>
+                  <span className="text-background break-words">{filterProfanity(m.text)}</span>
                 </div>
                 {!isMine && (
                   <Link
