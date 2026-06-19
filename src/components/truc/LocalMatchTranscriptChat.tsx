@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { useT } from "@/i18n/useT";
 import type { PlayerId } from "@/game/types";
 import { phraseText, type ChatMessage } from "@/game/phrases";
+import { filterProfanity } from "@/online/profanityFilter";
 
 interface Props {
   /** Transcripció completa dels missatges (cants/preguntes/respostes) de la partida. */
@@ -125,7 +126,7 @@ export function LocalMatchTranscriptChat({
                           {senderName}:
                         </span>
                         <span className="break-words text-table-felt">
-                          {m.text ?? phraseText(m.phraseId, m.vars)}
+                          {filterProfanity(m.text ?? phraseText(m.phraseId, m.vars))}
                         </span>
                       </div>
                     </div>
