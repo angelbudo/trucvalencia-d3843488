@@ -750,30 +750,109 @@ async function sendTextMessage(input: z.infer<typeof SendTextMessageSchema>) {
     ? (input.senderName?.trim() || "Espectador").slice(0, 60)
     : null;
 
-  // Moderación automática con OpenAI antes de publicar el mensaje.
-  const mod = await moderateWithOpenAI(text);
-  if (mod.flagged) {
-    // Bloquea: no llega a `room_text_chat` (Realtime no lo difunde) y se
-    // registra un flag contra el emisor para activar el trigger acumulativo
-    // de moderación (`device_moderation` + `account_moderation`).
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-    const flagPayload: Record<string, unknown> = {
-      room_id: input.roomId,
-      target_seat: seat,
-      target_device_id: input.deviceId,
-      reporter_device_id: "openai-moderation",
-      message_text: text.slice(0, 500),
-      expires_at: expiresAt,
-    };
-    await supabase.from("room_chat_flags").insert(flagPayload);
-    return { ok: true as const, blocked: true, categories: mod.categories };
-  }
-
-  const { error } = await supabase.from("room_text_chat").insert({
-    room_id: input.roomId, seat, device_id: input.deviceId, text, sender_name: senderName,
-  });
+  // ─── ESTRATEGIA "BÚNKER DE LA IA" ──────────────────────────────
+  // 1) Insertamos SIEMPRE el mensaje como visible: el chat fluye sin
+  //    pausas y se censura cosméticamente en el cliente (filterProfanity).
+  // 2) Por detrás, la IA evalúa el original y, si cruza la línea roja
+  //    (racismo/amenazas/etc.) o si el emisor ya está en Shadow Ban
+  //    (>=28 puntos en 30 días), marcamos status='blocked'. Realtime
+  //    propaga el UPDATE y todos los clientes lo retiran de pantalla.
+  const { data: inserted, error } = await supabase
+    .from("room_text_chat")
+    .insert({
+      room_id: input.roomId, seat, device_id: input.deviceId, text, sender_name: senderName,
+    })
+    .select("id")
+    .single();
   if (error) throw new Error(error.message);
-  return { ok: true as const, blocked: false };
+  const messageId = (inserted as { id: number }).id;
+
+  // Ejecutamos la moderación en segundo plano: no bloqueamos la
+  // respuesta al cliente. El UPDATE de status llegará por Realtime.
+  void evaluateAndMaybeBlock({
+    roomId: input.roomId,
+    deviceId: input.deviceId,
+    seat,
+    text,
+    messageId,
+  });
+
+  return { ok: true as const, messageId };
+}
+
+/** Categorías de OpenAI Moderation consideradas "línea roja" → bloqueo
+ *  inmediato sin pasar por el sistema de puntos. */
+const RED_LINE_CATEGORIES = new Set<string>([
+  "hate",
+  "hate/threatening",
+  "harassment/threatening",
+  "sexual/minors",
+  "violence",
+  "violence/graphic",
+  "self-harm",
+  "self-harm/intent",
+  "self-harm/instructions",
+]);
+
+const SHADOW_BAN_POINTS = 28;
+
+async function evaluateAndMaybeBlock(args: {
+  roomId: string;
+  deviceId: string;
+  seat: number | null;
+  text: string;
+  messageId: number;
+}): Promise<void> {
+  try {
+    const mod = await moderateWithOpenAI(args.text);
+
+    // Si la IA detecta cualquier categoría, registramos el flag para que
+    // el trigger v3 (handle_chat_report) acumule puntos por gravedad.
+    if (mod.flagged) {
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await supabase.from("room_chat_flags").insert({
+        room_id: args.roomId,
+        target_seat: args.seat,
+        target_device_id: args.deviceId,
+        reporter_device_id: "openai-moderation",
+        message_id: args.messageId,
+        message_text: args.text.slice(0, 500),
+        expires_at: expiresAt,
+      });
+    }
+
+    // Decisión de bloqueo:
+    //   (a) línea roja directa, o
+    //   (b) shadow-ban activo (>=28 puntos / 30 días en este device).
+    const crossesRedLine =
+      mod.flagged && mod.categories.some((c) => RED_LINE_CATEGORIES.has(c));
+
+    let inShadowBan = false;
+    if (!crossesRedLine) {
+      const sinceIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: rows } = await supabase
+        .from("room_chat_flags")
+        .select("weight")
+        .eq("target_device_id", args.deviceId)
+        .eq("counted", true)
+        .gte("created_at", sinceIso);
+      const total = (rows ?? []).reduce(
+        (acc: number, r: { weight: number | null }) => acc + (r.weight ?? 0),
+        0,
+      );
+      inShadowBan = total >= SHADOW_BAN_POINTS;
+    }
+
+    if (crossesRedLine || inShadowBan) {
+      await supabase
+        .from("room_text_chat")
+        .update({ status: "blocked" })
+        .eq("id", args.messageId);
+    }
+  } catch (_e) {
+    // Falla en silencio: el mensaje queda visible (mejor falso negativo
+    // puntual que romper el chat por un outage del moderador).
+  }
 }
 
 // ===========================================================================
