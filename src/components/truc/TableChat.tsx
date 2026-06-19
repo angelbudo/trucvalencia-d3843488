@@ -12,6 +12,7 @@ import { formatChatFlagNotice, type ChatFlagNotice } from "@/online/chatFlagNoti
 import { PlayerProfileDialog } from "@/online/PlayerProfileDialog";
 import { usePresenceNamesByDevice } from "@/online/useLobbyPresence";
 import { useLocalMute } from "@/online/useLocalMute";
+import { filterProfanity } from "@/online/profanityFilter";
 
 const MAX_LEN = 200;
 
