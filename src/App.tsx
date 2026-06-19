@@ -28,6 +28,13 @@ import EsborrarDades from "./pages/EsborrarDades";
 
 import Moderacio from "./pages/admin/Moderacio";
 import Regles from "./pages/Regles";
+import { loadBlacklistFromSupabase } from "@/online/profanityFilter";
+
+// Carrega la blacklist el més aviat possible (idempotent).
+// Si Supabase falla o tarda, el filtre ja funciona amb la llista per defecte.
+if (typeof window !== "undefined") {
+  void loadBlacklistFromSupabase();
+}
 import Auth from "./pages/Auth";
 import Perfil from "./pages/Perfil";
 import PerfilPublic from "./pages/PerfilPublic";
