@@ -259,7 +259,7 @@ export function TableChat({
                         isSpectatorMsg ? "text-foreground/70" : "text-foreground/90",
                       )}
                     >
-                      {m.text}
+                      {filterProfanity(m.text)}
                     </span>
                     {seatMuted && (
                       <span
