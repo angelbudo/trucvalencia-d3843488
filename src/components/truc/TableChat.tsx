@@ -12,6 +12,7 @@ import { formatChatFlagNotice, type ChatFlagNotice } from "@/online/chatFlagNoti
 import { PlayerProfileDialog } from "@/online/PlayerProfileDialog";
 import { usePresenceNamesByDevice } from "@/online/useLobbyPresence";
 import { useLocalMute } from "@/online/useLocalMute";
+import { filterProfanity } from "@/online/profanityFilter";
 
 const MAX_LEN = 200;
 
@@ -258,7 +259,7 @@ export function TableChat({
                         isSpectatorMsg ? "text-foreground/70" : "text-foreground/90",
                       )}
                     >
-                      {m.text}
+                      {filterProfanity(m.text)}
                     </span>
                     {seatMuted && (
                       <span
