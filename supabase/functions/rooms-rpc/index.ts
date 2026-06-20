@@ -1919,6 +1919,7 @@ const handlers: Record<string, Handler> = {
   verifyRoomPassword: withSchema(VerifyRoomPasswordSchema, verifyRoomPassword),
   sendChatPhrase: withSchema(SendChatPhraseSchema, sendChatPhrase),
   sendTextMessage: withSchema(SendTextMessageSchema, sendTextMessage),
+  sendSalaTextMessage: withSchema(SendSalaTextMessageSchema, sendSalaTextMessage),
   flagPlayerInChat: notImplemented,
   adminListChatFlags: notImplemented,
   adminDecideChatFlag: notImplemented,
