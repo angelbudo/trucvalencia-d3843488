@@ -780,6 +780,101 @@ async function sendTextMessage(input: z.infer<typeof SendTextMessageSchema>) {
   return { ok: true as const, messageId };
 }
 
+// ─── CHAT DE SALA (lobby) — mateix búnker que el chat de mesa ──────────────
+const SendSalaTextMessageSchema = z.object({
+  salaSlug: z.string().min(1).max(60),
+  deviceId: z.string().min(1),
+  name: z.string().min(1).max(40),
+  text: z.string().min(1).max(240),
+});
+
+async function sendSalaTextMessage(input: z.infer<typeof SendSalaTextMessageSchema>) {
+  const text = input.text.trim();
+  if (!text) throw new Error("empty_text");
+  const name = input.name.trim().slice(0, 40) || "Jugador";
+
+  // Inserta sempre el missatge (mateixa estratègia "búnker"): si la IA
+  // detecta línia roja l'amaga després via status='blocked' (requereix
+  // que la migració v5 hagi afegit la columna a `sala_chat`).
+  const { data: inserted, error } = await supabase
+    .from("sala_chat")
+    .insert({
+      sala_slug: input.salaSlug,
+      device_id: input.deviceId,
+      name,
+      text,
+    })
+    .select("id")
+    .single();
+  if (error) throw new Error(error.message);
+  const messageId = (inserted as { id: number }).id;
+
+  void evaluateAndMaybeBlockSala({
+    salaSlug: input.salaSlug,
+    deviceId: input.deviceId,
+    text,
+    messageId,
+  });
+
+  return { ok: true as const, messageId };
+}
+
+async function evaluateAndMaybeBlockSala(args: {
+  salaSlug: string;
+  deviceId: string;
+  text: string;
+  messageId: number;
+}): Promise<void> {
+  try {
+    const [local, mod] = await Promise.all([
+      detectLocalProfanity(args.text),
+      moderateWithOpenAI(args.text),
+    ]);
+
+    // Els flags del lobby s'emmagatzemen amb room_id=NULL i target_seat=NULL.
+    // Alimenten EL MATEIX sistema de punts/Shadow Ban que el chat de mesa.
+    await persistModerationFlags({
+      source: "sala",
+      roomId: null,
+      seat: null,
+      deviceId: args.deviceId,
+      text: args.text,
+      messageId: args.messageId,
+      local,
+      mod,
+    });
+
+    const crossesRedLine =
+      mod.flagged && mod.categories.some((c) => RED_LINE_CATEGORIES.has(c));
+
+    let inShadowBan = false;
+    if (!crossesRedLine) {
+      const sinceIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: rows } = await supabase
+        .from("room_chat_flags")
+        .select("weight")
+        .eq("target_device_id", args.deviceId)
+        .eq("counted", true)
+        .gte("created_at", sinceIso);
+      const total = (rows ?? []).reduce(
+        (acc: number, r: { weight: number | null }) => acc + (r.weight ?? 0),
+        0,
+      );
+      inShadowBan = total >= SHADOW_BAN_POINTS;
+    }
+
+    if (crossesRedLine || inShadowBan) {
+      const { error: blkErr } = await (supabase as any)
+        .from("sala_chat")
+        .update({ status: "blocked" })
+        .eq("id", args.messageId);
+      if (blkErr) console.error("[moderation] sala block update failed:", JSON.stringify(blkErr));
+    }
+  } catch (e) {
+    console.error("[moderation] evaluate sala error:", (e as Error)?.message, (e as Error)?.stack);
+  }
+}
+
 /** Categorías de OpenAI Moderation consideradas "línea roja" → bloqueo
  *  inmediato sin pasar por el sistema de puntos. */
 const RED_LINE_CATEGORIES = new Set<string>([
@@ -859,10 +954,18 @@ async function getBlacklistWords(): Promise<string[]> {
     const words = (data ?? [])
       .map((r: { word: string | null }) => (r?.word ?? "").trim())
       .filter((w: string) => w.length > 0);
-    const merged = words.length > 0 ? words : DEFAULT_BAD_WORDS_FALLBACK;
+    // Sempre UNIM blacklist DB + fallback hardcoded. Si la taula està buida
+    // o no conté les paraules típiques, el fallback continua actiu.
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const w of [...words, ...DEFAULT_BAD_WORDS_FALLBACK]) {
+      const k = stripDiacritics(w.toLowerCase());
+      if (k && !seen.has(k)) { seen.add(k); merged.push(w); }
+    }
     _blacklistCache = { words: merged, loadedAt: now };
     return merged;
-  } catch {
+  } catch (e) {
+    console.warn("[moderation] blacklist load failed, using fallback:", (e as Error)?.message);
     _blacklistCache = { words: DEFAULT_BAD_WORDS_FALLBACK, loadedAt: now };
     return DEFAULT_BAD_WORDS_FALLBACK;
   }
@@ -909,44 +1012,22 @@ async function evaluateAndMaybeBlock(args: {
   try {
     // 1) Detección LOCAL (blacklist DB + fallback). Se ejecuta SIEMPRE
     //    para que el sistema de puntos funcione aunque OpenAI no esté.
-    const local = await detectLocalProfanity(args.text);
-
-    // 2) Detección IA (línea roja: racismo, amenazas, sexo con menores…).
-    const mod = await moderateWithOpenAI(args.text);
-
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-
-    // Flag de la blacklist local — `reason` controla el `weight` que aplica
-    // el trigger v3: 'llenguatge' = 2 pts, 'antiesportiu' = 1 pt.
-    if (local) {
-      const reason = local.severity === "severe" ? "llenguatge" : "antiesportiu";
-      const { error: flagErr } = await supabase.from("room_chat_flags").insert({
-        room_id: args.roomId,
-        target_seat: args.seat,
-        target_device_id: args.deviceId,
-        reporter_device_id: "local-blacklist",
-        message_id: args.messageId,
-        message_text: args.text.slice(0, 500),
-        reason,
-        expires_at: expiresAt,
-      });
-      if (flagErr) console.warn("[moderation] local flag insert failed:", flagErr.message);
-    }
-
-    // Flag de la IA (sólo cuando OpenAI ha marcado el mensaje).
-    if (mod.flagged) {
-      const { error: flagErr } = await supabase.from("room_chat_flags").insert({
-        room_id: args.roomId,
-        target_seat: args.seat,
-        target_device_id: args.deviceId,
-        reporter_device_id: "openai-moderation",
-        message_id: args.messageId,
-        message_text: args.text.slice(0, 500),
-        reason: "llenguatge",
-        expires_at: expiresAt,
-      });
-      if (flagErr) console.warn("[moderation] openai flag insert failed:", flagErr.message);
-    }
+    // Local + OpenAI en paralelo (no nos hace falta secuencial: OpenAI no
+    // bloquea al canal local).
+    const [local, mod] = await Promise.all([
+      detectLocalProfanity(args.text),
+      moderateWithOpenAI(args.text),
+    ]);
+    await persistModerationFlags({
+      source: "room",
+      roomId: args.roomId,
+      seat: args.seat,
+      deviceId: args.deviceId,
+      text: args.text,
+      messageId: args.messageId,
+      local,
+      mod,
+    });
 
     // Decisión de bloqueo:
     //   (a) línea roja directa, o
@@ -971,15 +1052,85 @@ async function evaluateAndMaybeBlock(args: {
     }
 
     if (crossesRedLine || inShadowBan) {
-      await supabase
+      const { error: blkErr } = await supabase
         .from("room_text_chat")
         .update({ status: "blocked" })
         .eq("id", args.messageId);
+      if (blkErr) console.error("[moderation] room block update failed:", JSON.stringify(blkErr));
     }
   } catch (e) {
     // Falla en silencio: el mensaje queda visible (mejor falso negativo
     // puntual que romper el chat por un outage del moderador).
-    console.warn("[moderation] evaluate error:", (e as Error)?.message);
+    console.error("[moderation] evaluate error:", (e as Error)?.message, (e as Error)?.stack);
+  }
+}
+
+/**
+ * Inserta los flags en `room_chat_flags`. Reutilizado por chat de mesa y
+ * chat de sala (lobby). Para la sala no hay seat ni room_id; usamos NULL
+ * (requiere migración v5 que relaja las NOT NULL).
+ */
+async function persistModerationFlags(args: {
+  source: "room" | "sala";
+  roomId: string | null;
+  seat: number | null;
+  deviceId: string;
+  text: string;
+  messageId: number | null;
+  local: { severity: "severe" | "mild"; hit: string } | null;
+  mod: { flagged: boolean; categories: string[] };
+}): Promise<void> {
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  if (args.local) {
+    const reason = args.local.severity === "severe" ? "llenguatge" : "antiesportiu";
+    const row: Record<string, unknown> = {
+      room_id: args.roomId,
+      target_seat: args.seat,
+      target_device_id: args.deviceId,
+      reporter_device_id: "local-blacklist",
+      message_id: args.messageId,
+      message_text: args.text.slice(0, 500),
+      reason,
+      expires_at: expiresAt,
+    };
+    const { error } = await supabase.from("room_chat_flags").insert(row);
+    if (error) {
+      console.error(
+        `[moderation] local flag insert failed (source=${args.source}, hit=${args.local.hit}):`,
+        JSON.stringify(error),
+        "row=", JSON.stringify(row),
+      );
+    } else {
+      console.log(
+        `[moderation] local flag stored (source=${args.source}, sev=${args.local.severity}, hit=${args.local.hit}, dev=${args.deviceId})`,
+      );
+    }
+  }
+
+  if (args.mod.flagged) {
+    const row: Record<string, unknown> = {
+      room_id: args.roomId,
+      target_seat: args.seat,
+      target_device_id: args.deviceId,
+      reporter_device_id: "openai-moderation",
+      message_id: args.messageId,
+      message_text: args.text.slice(0, 500),
+      reason: "llenguatge",
+      expires_at: expiresAt,
+    };
+    const { error } = await supabase.from("room_chat_flags").insert(row);
+    if (error) {
+      console.error(
+        `[moderation] openai flag insert failed (source=${args.source}, cats=${args.mod.categories.join(",")}):`,
+        JSON.stringify(error),
+        "row=", JSON.stringify(row),
+      );
+    } else {
+      console.log(
+        `[moderation] openai flag stored (source=${args.source}, cats=${args.mod.categories.join(",")}, dev=${args.deviceId})`,
+      );
+    }
   }
 }
 
@@ -1768,6 +1919,7 @@ const handlers: Record<string, Handler> = {
   verifyRoomPassword: withSchema(VerifyRoomPasswordSchema, verifyRoomPassword),
   sendChatPhrase: withSchema(SendChatPhraseSchema, sendChatPhrase),
   sendTextMessage: withSchema(SendTextMessageSchema, sendTextMessage),
+  sendSalaTextMessage: withSchema(SendSalaTextMessageSchema, sendSalaTextMessage),
   flagPlayerInChat: notImplemented,
   adminListChatFlags: notImplemented,
   adminDecideChatFlag: notImplemented,
