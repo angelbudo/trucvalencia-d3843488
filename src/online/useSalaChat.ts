@@ -18,6 +18,7 @@ interface Row {
   name: string;
   text: string;
   created_at: string;
+  status?: string | null;
 }
 
 const MAX_MESSAGES = 80;
@@ -32,6 +33,10 @@ function toMsg(r: Row): SalaChatMessage {
     text: r.text,
     createdAt: new Date(r.created_at).getTime(),
   };
+}
+
+function isVisibleRow(r: Row): boolean {
+  return !r.status || r.status === "visible";
 }
 
 /** Subscriu-se als missatges del xat d'una sala (lobby de sala). */
@@ -56,7 +61,7 @@ export function useSalaChat(salaSlug: string | null) {
         .limit(MAX_MESSAGES)
         .then(({ data }) => {
           if (cancelled || !data) return;
-          const rows = (data as Row[]).slice().reverse();
+          const rows = (data as Row[]).filter(isVisibleRow).slice().reverse();
           const cutoff = Date.now() - MAX_AGE_MS;
           setMessages((prev) => {
             const byId = new Map<number, SalaChatMessage>();
@@ -99,12 +104,25 @@ export function useSalaChat(salaSlug: string | null) {
           { event: "INSERT", schema: "public", table: "sala_chat", filter: `sala_slug=eq.${salaSlug}` },
           (payload) => {
             if (cancelled) return;
-            const msg = toMsg(payload.new as Row);
+            const row = payload.new as Row;
+            if (!isVisibleRow(row)) return;
+            const msg = toMsg(row);
             setMessages((prev) => {
               if (prev.some((m) => m.id === msg.id)) return prev;
               const next = [...prev, msg];
               return next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next;
             });
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "sala_chat", filter: `sala_slug=eq.${salaSlug}` },
+          (payload) => {
+            if (cancelled) return;
+            const row = payload.new as Row;
+            if (!isVisibleRow(row)) {
+              setMessages((prev) => prev.filter((m) => m.id !== row.id));
+            }
           },
         )
         .subscribe((status) => {
@@ -161,13 +179,32 @@ export async function sendSalaChat(input: {
   const text = input.text.trim().slice(0, 200);
   if (!text) throw new Error("Missatge buit");
   const name = (input.name || "").trim().slice(0, 40) || "Jugador";
-  const { error } = await (supabase as any)
-    .from("sala_chat")
-    .insert({
-      sala_slug: input.salaSlug,
-      device_id: input.deviceId,
-      name,
-      text,
+  // El xat de sala passa per la mateixa Edge Function que el de la mesa
+  // perquè la moderació (blacklist + OpenAI + punts/Shadow Ban) sigui
+  // idèntica en ambdós xats. Si la funció falla, no caiem en silenci:
+  // intentem l'insert directe perquè el missatge no es perdi.
+  try {
+    const { data, error } = await supabase.functions.invoke("rooms-rpc", {
+      body: {
+        fn: "sendSalaTextMessage",
+        data: { salaSlug: input.salaSlug, deviceId: input.deviceId, name, text },
+      },
     });
-  if (error) throw new Error(error.message || "No s'ha pogut enviar");
+    if (error) throw new Error(error.message || "rpc_error");
+    if (data && typeof data === "object" && "error" in data && (data as any).error) {
+      throw new Error((data as any).error);
+    }
+    return;
+  } catch (e) {
+    console.warn("[sala_chat] rpc failed, fallback to direct insert:", (e as Error)?.message);
+    const { error } = await (supabase as any)
+      .from("sala_chat")
+      .insert({
+        sala_slug: input.salaSlug,
+        device_id: input.deviceId,
+        name,
+        text,
+      });
+    if (error) throw new Error(error.message || "No s'ha pogut enviar");
+  }
 }
