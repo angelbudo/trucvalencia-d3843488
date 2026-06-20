@@ -859,10 +859,18 @@ async function getBlacklistWords(): Promise<string[]> {
     const words = (data ?? [])
       .map((r: { word: string | null }) => (r?.word ?? "").trim())
       .filter((w: string) => w.length > 0);
-    const merged = words.length > 0 ? words : DEFAULT_BAD_WORDS_FALLBACK;
+    // Sempre UNIM blacklist DB + fallback hardcoded. Si la taula està buida
+    // o no conté les paraules típiques, el fallback continua actiu.
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const w of [...words, ...DEFAULT_BAD_WORDS_FALLBACK]) {
+      const k = stripDiacritics(w.toLowerCase());
+      if (k && !seen.has(k)) { seen.add(k); merged.push(w); }
+    }
     _blacklistCache = { words: merged, loadedAt: now };
     return merged;
-  } catch {
+  } catch (e) {
+    console.warn("[moderation] blacklist load failed, using fallback:", (e as Error)?.message);
     _blacklistCache = { words: DEFAULT_BAD_WORDS_FALLBACK, loadedAt: now };
     return DEFAULT_BAD_WORDS_FALLBACK;
   }
