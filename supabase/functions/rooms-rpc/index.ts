@@ -796,6 +796,109 @@ const RED_LINE_CATEGORIES = new Set<string>([
 
 const SHADOW_BAN_POINTS = 28;
 
+// ─── DETECCIÓN LOCAL DE LENGUAJE OFENSIVO (espejo de profanityFilter.ts) ──
+// Mismas listas que el cliente para que el "búnker" siempre genere un flag
+// en `room_chat_flags` aunque OpenAI no esté configurado o esté caído.
+const MILD_INTERJECTIONS = new Set<string>([
+  "joder", "jodete",
+  "mierda", "mierdas",
+  "coño", "cono",
+  "merda", "merdes",
+  "collons", "carall",
+  "punyeta", "punyetes",
+]);
+
+const DEFAULT_BAD_WORDS_FALLBACK: string[] = [
+  "puta", "putas", "puto", "putos",
+  "gilipollas", "gilipuertas",
+  "cabron", "cabrones", "cabrona",
+  "hijoputa", "hijodeputa", "hdp",
+  "mierda", "mierdas",
+  "joder", "jodete",
+  "coño", "cono",
+  "polla", "pollas",
+  "follar", "follate",
+  "maricon", "maricones",
+  "zorra", "zorras",
+  "imbecil", "imbeciles",
+  "idiota", "idiotas",
+  "subnormal", "subnormales",
+  "estupido", "estupida",
+  "tonto", "tonta",
+  "capullo", "capullos",
+  "panoli",
+  "retrasado", "retrasada",
+  "fillputa", "fillsdeputa", "fillputes",
+  "cabro", "cabrons",
+  "merda", "merdes",
+  "collons",
+  "punyeta", "punyetes",
+  "carall",
+  "imbecils",
+  "estupit",
+  "ximple", "ximplos",
+  "tarat", "tarats",
+  "burro", "burros",
+  "amaricat",
+];
+
+function stripDiacritics(s: string): string {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+let _blacklistCache: { words: string[]; loadedAt: number } | null = null;
+const BLACKLIST_TTL_MS = 5 * 60 * 1000;
+
+async function getBlacklistWords(): Promise<string[]> {
+  const now = Date.now();
+  if (_blacklistCache && now - _blacklistCache.loadedAt < BLACKLIST_TTL_MS) {
+    return _blacklistCache.words;
+  }
+  try {
+    const { data } = await supabase.from("blacklist").select("word");
+    const words = (data ?? [])
+      .map((r: { word: string | null }) => (r?.word ?? "").trim())
+      .filter((w: string) => w.length > 0);
+    const merged = words.length > 0 ? words : DEFAULT_BAD_WORDS_FALLBACK;
+    _blacklistCache = { words: merged, loadedAt: now };
+    return merged;
+  } catch {
+    _blacklistCache = { words: DEFAULT_BAD_WORDS_FALLBACK, loadedAt: now };
+    return DEFAULT_BAD_WORDS_FALLBACK;
+  }
+}
+
+function buildWordPattern(word: string): RegExp {
+  const norm = stripDiacritics(word.toLowerCase());
+  const body = Array.from(norm).map((ch) => {
+    if (!/[a-z]/.test(ch)) return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return `${ch}+`;
+  }).join("");
+  return new RegExp(`(^|[^\\p{L}\\p{N}])(${body})(?=$|[^\\p{L}\\p{N}])`, "iu");
+}
+
+/** Detecta si el texto contiene palabras de la lista negra. Devuelve la
+ *  severidad más alta encontrada: "severe" (insulto) o "mild" (interjección)
+ *  o null si no hay coincidencias. */
+async function detectLocalProfanity(
+  text: string,
+): Promise<{ severity: "severe" | "mild"; hit: string } | null> {
+  if (!text) return null;
+  const words = await getBlacklistWords();
+  let mildHit: string | null = null;
+  for (const raw of words) {
+    const key = stripDiacritics(raw.trim().toLowerCase());
+    if (!key) continue;
+    if (buildWordPattern(key).test(text)) {
+      if (!MILD_INTERJECTIONS.has(key)) {
+        return { severity: "severe", hit: key };
+      }
+      if (!mildHit) mildHit = key;
+    }
+  }
+  return mildHit ? { severity: "mild", hit: mildHit } : null;
+}
+
 async function evaluateAndMaybeBlock(args: {
   roomId: string;
   deviceId: string;
@@ -804,21 +907,45 @@ async function evaluateAndMaybeBlock(args: {
   messageId: number;
 }): Promise<void> {
   try {
+    // 1) Detección LOCAL (blacklist DB + fallback). Se ejecuta SIEMPRE
+    //    para que el sistema de puntos funcione aunque OpenAI no esté.
+    const local = await detectLocalProfanity(args.text);
+
+    // 2) Detección IA (línea roja: racismo, amenazas, sexo con menores…).
     const mod = await moderateWithOpenAI(args.text);
 
-    // Si la IA detecta cualquier categoría, registramos el flag para que
-    // el trigger v3 (handle_chat_report) acumule puntos por gravedad.
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+    // Flag de la blacklist local — `reason` controla el `weight` que aplica
+    // el trigger v3: 'llenguatge' = 2 pts, 'antiesportiu' = 1 pt.
+    if (local) {
+      const reason = local.severity === "severe" ? "llenguatge" : "antiesportiu";
+      const { error: flagErr } = await supabase.from("room_chat_flags").insert({
+        room_id: args.roomId,
+        target_seat: args.seat,
+        target_device_id: args.deviceId,
+        reporter_device_id: "local-blacklist",
+        message_id: args.messageId,
+        message_text: args.text.slice(0, 500),
+        reason,
+        expires_at: expiresAt,
+      });
+      if (flagErr) console.warn("[moderation] local flag insert failed:", flagErr.message);
+    }
+
+    // Flag de la IA (sólo cuando OpenAI ha marcado el mensaje).
     if (mod.flagged) {
-      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      await supabase.from("room_chat_flags").insert({
+      const { error: flagErr } = await supabase.from("room_chat_flags").insert({
         room_id: args.roomId,
         target_seat: args.seat,
         target_device_id: args.deviceId,
         reporter_device_id: "openai-moderation",
         message_id: args.messageId,
         message_text: args.text.slice(0, 500),
+        reason: "llenguatge",
         expires_at: expiresAt,
       });
+      if (flagErr) console.warn("[moderation] openai flag insert failed:", flagErr.message);
     }
 
     // Decisión de bloqueo:
@@ -849,9 +976,10 @@ async function evaluateAndMaybeBlock(args: {
         .update({ status: "blocked" })
         .eq("id", args.messageId);
     }
-  } catch (_e) {
+  } catch (e) {
     // Falla en silencio: el mensaje queda visible (mejor falso negativo
     // puntual que romper el chat por un outage del moderador).
+    console.warn("[moderation] evaluate error:", (e as Error)?.message);
   }
 }
 
