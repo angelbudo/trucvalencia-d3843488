@@ -780,6 +780,101 @@ async function sendTextMessage(input: z.infer<typeof SendTextMessageSchema>) {
   return { ok: true as const, messageId };
 }
 
+// ─── CHAT DE SALA (lobby) — mateix búnker que el chat de mesa ──────────────
+const SendSalaTextMessageSchema = z.object({
+  salaSlug: z.string().min(1).max(60),
+  deviceId: z.string().min(1),
+  name: z.string().min(1).max(40),
+  text: z.string().min(1).max(240),
+});
+
+async function sendSalaTextMessage(input: z.infer<typeof SendSalaTextMessageSchema>) {
+  const text = input.text.trim();
+  if (!text) throw new Error("empty_text");
+  const name = input.name.trim().slice(0, 40) || "Jugador";
+
+  // Inserta sempre el missatge (mateixa estratègia "búnker"): si la IA
+  // detecta línia roja l'amaga després via status='blocked' (requereix
+  // que la migració v5 hagi afegit la columna a `sala_chat`).
+  const { data: inserted, error } = await supabase
+    .from("sala_chat")
+    .insert({
+      sala_slug: input.salaSlug,
+      device_id: input.deviceId,
+      name,
+      text,
+    })
+    .select("id")
+    .single();
+  if (error) throw new Error(error.message);
+  const messageId = (inserted as { id: number }).id;
+
+  void evaluateAndMaybeBlockSala({
+    salaSlug: input.salaSlug,
+    deviceId: input.deviceId,
+    text,
+    messageId,
+  });
+
+  return { ok: true as const, messageId };
+}
+
+async function evaluateAndMaybeBlockSala(args: {
+  salaSlug: string;
+  deviceId: string;
+  text: string;
+  messageId: number;
+}): Promise<void> {
+  try {
+    const [local, mod] = await Promise.all([
+      detectLocalProfanity(args.text),
+      moderateWithOpenAI(args.text),
+    ]);
+
+    // Els flags del lobby s'emmagatzemen amb room_id=NULL i target_seat=NULL.
+    // Alimenten EL MATEIX sistema de punts/Shadow Ban que el chat de mesa.
+    await persistModerationFlags({
+      source: "sala",
+      roomId: null,
+      seat: null,
+      deviceId: args.deviceId,
+      text: args.text,
+      messageId: args.messageId,
+      local,
+      mod,
+    });
+
+    const crossesRedLine =
+      mod.flagged && mod.categories.some((c) => RED_LINE_CATEGORIES.has(c));
+
+    let inShadowBan = false;
+    if (!crossesRedLine) {
+      const sinceIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: rows } = await supabase
+        .from("room_chat_flags")
+        .select("weight")
+        .eq("target_device_id", args.deviceId)
+        .eq("counted", true)
+        .gte("created_at", sinceIso);
+      const total = (rows ?? []).reduce(
+        (acc: number, r: { weight: number | null }) => acc + (r.weight ?? 0),
+        0,
+      );
+      inShadowBan = total >= SHADOW_BAN_POINTS;
+    }
+
+    if (crossesRedLine || inShadowBan) {
+      const { error: blkErr } = await (supabase as any)
+        .from("sala_chat")
+        .update({ status: "blocked" })
+        .eq("id", args.messageId);
+      if (blkErr) console.error("[moderation] sala block update failed:", JSON.stringify(blkErr));
+    }
+  } catch (e) {
+    console.error("[moderation] evaluate sala error:", (e as Error)?.message, (e as Error)?.stack);
+  }
+}
+
 /** Categorías de OpenAI Moderation consideradas "línea roja" → bloqueo
  *  inmediato sin pasar por el sistema de puntos. */
 const RED_LINE_CATEGORIES = new Set<string>([
