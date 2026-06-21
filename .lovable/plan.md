@@ -1,94 +1,137 @@
-# Sistema de Penalización por Abandono (Leaver Penalty)
+# Sistema de roles y bandeja de moderació integrada
 
-Sistema **totalmente independiente** del de moderación por comportamiento/IA. Vive en sus propias tablas y nunca contribuye al baneo definitivo.
+## Objectiu
+Substituir l'actual `/admin/moderacio` (protegida per contrasenya local) per un sistema real de rols (`user` / `moderator` / `admin`) basat en Supabase, amb ruta protegida i una bandeja d'entrada estil correu adaptada a mòbil i escriptori.
 
-## 1. Base de datos (migración nueva)
+## 1. Base de dades (migració SQL)
 
-### Tabla `public.leaver_penalty`
-Una fila por jugador (clave compuesta: una por dispositivo, otra por cuenta — igual que el sistema de moderación existente, para que el castigo siga al usuario aunque cambie de móvil).
+Crear migració `docs/roles-and-moderation-inbox-schema.sql`:
 
+```sql
+-- Enum de rols
+create type public.app_role as enum ('user','moderator','admin');
+
+-- Taula user_roles (mai al perfil)
+create table public.user_roles (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role app_role not null default 'user',
+  granted_at timestamptz not null default now(),
+  granted_by uuid references auth.users(id),
+  unique (user_id, role)
+);
+
+grant select on public.user_roles to authenticated;
+grant all on public.user_roles to service_role;
+alter table public.user_roles enable row level security;
+
+-- Funció security definer (evita recursió RLS)
+create or replace function public.has_role(_user_id uuid, _role app_role)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.user_roles where user_id = _user_id and role = _role)
+$$;
+
+-- Policies
+create policy "users read own roles" on public.user_roles
+  for select to authenticated using (user_id = auth.uid());
+create policy "admins read all roles" on public.user_roles
+  for select to authenticated using (public.has_role(auth.uid(),'admin'));
+create policy "admins manage roles" on public.user_roles
+  for all to authenticated using (public.has_role(auth.uid(),'admin'))
+  with check (public.has_role(auth.uid(),'admin'));
+
+-- Seed: el meu usuari com a admin (substituir <UUID> manualment a Supabase)
+-- insert into public.user_roles (user_id, role) values ('<UUID>', 'admin');
 ```
-device_id            text PRIMARY KEY        -- o user_id en la variante account
-leave_count          int not null default 0  -- contador 0..3
-ban_count            int not null default 0  -- nº veces que ha llegado a baneo (informativo)
-banned_until         timestamptz             -- null si no está baneado
-last_leave_at        timestamptz             -- referencia para la recuperación
-updated_at           timestamptz not null default now()
+
+L'usuari haurà d'executar el `INSERT` final amb el seu propi `auth.users.id`. Li explicaré com fer-ho al final.
+
+## 2. Server functions (`src/online/moderation.functions.ts`)
+
+Noves functions amb `requireSupabaseAuth` que verifiquen rol via `has_role`:
+
+- `getMyRole()` → retorna `'user' | 'moderator' | 'admin'`.
+- `listChatFlags({ status })` → llegeix `room_chat_flags` amb join a `room_chat` per obtenir el text del missatge. Només per `moderator`/`admin`.
+- `listChatFlagsAudit({ flagId? })` → llegeix `room_chat_flags_audit`.
+- `decideChatFlag({ flagId, decision: 'approved'|'dismissed'|'pending', note? })` → actualitza `room_chat_flags` + insereix a `room_chat_flags_audit` amb `decided_by = userId`, `decided_at = now()`. `moderator` i `admin` poden usar-la.
+- `forgivePoints({ targetDeviceId })` → només `admin`. Marca flags aprovats com `dismissed` per anul·lar pes en la finestra de shadow ban.
+
+Cada handler comprova rol abans d'operar. Carrega `supabaseAdmin` dins el handler només quan calgui per llegir dades cross-user.
+
+## 3. Hook de rol (`src/hooks/useMyRole.ts`)
+
+```ts
+export function useMyRole(): { role: AppRole | null; isAdmin: boolean; isModerator: boolean; ready: boolean }
 ```
 
-Dos tablas gemelas: `leaver_penalty_device` (device_id) y `leaver_penalty_account` (user_id), idénticas en forma. Como en el sistema actual de moderación.
+Crida `getMyRole` via `useServerFn` + `useQuery`. Cau a `'user'` quan no hi ha sessió.
 
-GRANTs: `select` a `authenticated`, `all` a `service_role`. RLS activado con policy de lectura `using (true)` para que el cliente pueda mostrar el estado.
+## 4. Route guard
 
-Añadidas a `supabase_realtime` para que el OnlineBanGate reaccione al instante.
+Reescriure `src/pages/admin/Moderacio.tsx`:
+- Treure `useAdminPassword` i el formulari de contrasenya.
+- En montar, esperar `useAuth().ready` + `useMyRole()`. Si `role !== 'admin' && role !== 'moderator'` → `navigate('/', { replace: true })`.
+- Mentre carrega, spinner.
 
-### Función `public._apply_leaver_step(_table, _key_col, _key_val)`
-- Incrementa `leave_count`.
-- Si llega a 3 → `banned_until = now() + 24h`, `ban_count += 1`, `leave_count = 0`.
-- Actualiza `last_leave_at = now()`.
+## 5. UI bandeja d'entrada
 
-### Función `public.register_leave(p_device_id text, p_user_id uuid, p_room_id uuid)`
-RPC `security definer` que llama el cliente (o el server) al detectar abandono. Aplica el step al device y, si hay user_id, también a la cuenta.
+Mateixa pàgina `Moderacio.tsx`, amb `Tabs`:
+- **Alertes actives** (pestanya `pending`): tarjeta amb:
+  - Missatge en `bg-destructive/10 border-destructive/40 text-destructive font-medium` (vermell/taronja segons severitat — `llenguatge` vermell, `antiesportiu` taronja).
+  - `target_device_id` truncat + nom (si el tenim via `target_name`).
+  - Badge d'origen: `local-blacklist` o `openai-moderation` (llegit de `reporter_device_id`).
+  - Categoria (`reason`) i pes (`weight`).
+  - Data formatada.
+  - Botons segons rol:
+    - `admin` + `moderator`: "Aprovar baneig" (destructive), "Desestimar" (outline).
+    - `admin` només: "Perdonar punts" (ghost groc).
+- **Historial d'auditoria** (pestanya `audit`): llista de `room_chat_flags_audit` ordenada `decided_at desc`, mostrant decisió, moderador, motiu, data.
 
-### Función `public.decay_leaver_counters()`
-- Para cada fila con `leave_count > 0` y `last_leave_at < now() - interval '24 hours'` y sin baneo activo: `leave_count = greatest(leave_count - 1, 0)` y empuja `last_leave_at = now()` para que el siguiente decay sea otras 24h después.
-- Programada con `pg_cron` cada hora (si está disponible) — si no, se invoca de forma oportunista al cargar el estado del jugador.
+Responsive: `flex-col` mòbil, `max-w-4xl` centrat, tarjetes amb `p-4 rounded-lg`.
 
-## 2. Detección de abandono (cliente + RPC)
+## 6. Visibilitat condicional del botó
 
-El proyecto ya tiene flujo de salas en `supabase/functions/rooms-rpc/index.ts` y hooks `useRoomRealtime`/`useMyActiveRooms`. El abandono cuenta cuando:
-- El jugador deja la sala con partida **en curso** (no en lobby, no antes del reparto, no al terminar).
-- Desconexión sostenida (>X segundos) durante partida en curso → ya hay heurística de presencia.
+Identificar on hi ha el link cap a `/admin/moderacio` (probablement `Ajustes.tsx` o `Perfil.tsx`). Embolcallar amb `useMyRole()`:
 
-Se añade en `rooms-rpc`:
-- En el RPC existente `leaveRoom` (o equivalente), si el estado de la partida es "in_progress", invocar `register_leave` con `device_id` + `user_id` antes de quitar al jugador.
-- En la limpieza por timeout de presencia (si existe) hacer lo mismo.
+```tsx
+const { isAdmin, isModerator } = useMyRole();
+{(isAdmin || isModerator) && <Link to="/admin/moderacio">Moderació</Link>}
+```
 
-(Solo se toca la rama de partida en curso — abandonar la sala antes de empezar no penaliza.)
+Si no apareix avui al menú lateral, l'afegeixo a `Ajustes.tsx`.
 
-## 3. Frontend
+## 7. Auditoria automàtica
 
-### Nuevo hook `src/online/useLeaverPenalty.ts`
-Análogo a `useDeviceModeration`: suscribe a `leaver_penalty_device` por device_id y `leaver_penalty_account` por user_id, devuelve estado fusionado `{ leaveCount, bannedUntil, isBanned, loaded }`.
+`decideChatFlag` fa dues operacions dins el handler:
+1. `update room_chat_flags set status, decided_by=userId, decided_at=now(), moderator_note=note where id=flagId`.
+2. `insert into room_chat_flags_audit (flag_id, decision, decided_by, decided_at, reason) values (...)`.
 
-### `OnlineBanGate` — extender
-Hoy bloquea por `useDeviceModeration`. Se añade comprobación paralela del leaver penalty:
-- Si `useDeviceModeration.isBanned` → mensaje actual (comportamiento).
-- Si `useLeaverPenalty.isBanned` → **nuevo mensaje**: "Has sido suspendido 24 horas por **abandono reiterado de partidas online**. Podrás volver a jugar en HH:MM:SS." (traducido a ca / val / es).
-- Botón "Tancar aplicació" igual que el resto.
+Si la primera falla, no fa la segona. Si la segona falla, retorna `auditError` (com ja fa l'admin existent).
 
-Importante: el leaver penalty **solo bloquea la sección online**. El OnlineBanGate ya envuelve únicamente las rutas online, así que con esto basta — el menú offline / juego local sigue accesible. Si se ve que el gate envuelve toda la app, lo limitamos a las rutas `/online/*`.
+## 8. Compatibilitat amb el panell antic
 
-### Aviso adicional en la bandeja
-`src/lib/messagesInbox.ts` / `MessagesInbox.tsx`: al activarse el baneo (trigger DB) se inserta también un mensaje en la bandeja del jugador indicando motivo y fin del baneo. Lo hacemos desde `_apply_leaver_step` cuando se llega a baneo.
+Mantinc el path `/admin/moderacio` (catalan). L'usuari haurà d'eliminar manualment `useAdminPassword` del localStorage si vol; sinó simplement s'ignora.
 
-## 4. i18n
-Nuevas claves en `src/i18n/dict.ts`:
-- `leaverBanTitle`
-- `leaverBanBody` (con placeholder de tiempo restante)
-- `leaverBanReason` ("Abandono reiterado de partidas online" / "Abandonament reiterat de partides en línia" / valenciano)
-- `leaverInboxNotice`
+## Fitxers que es crearan / modificaran
 
-## 5. Independencia garantizada
-- Tablas separadas (`leaver_penalty_*`), nunca tocan `device_moderation` ni `account_moderation`.
-- Triggers separados, no llaman a `_apply_moderation_step`.
-- `OnlineBanGate` evalúa los dos sistemas por separado y muestra el mensaje que corresponda. El leaver penalty caduca por tiempo y resetea el contador a 0; no acumula hacia baneo permanente.
+**Nou:**
+- `docs/roles-and-moderation-inbox-schema.sql`
+- `src/online/moderation.functions.ts`
+- `src/hooks/useMyRole.ts`
 
-## 6. Detalles técnicos clave
-- Migración SQL con CREATE TABLE + GRANT + RLS + POLICY + funciones + trigger de publicación realtime, en este orden.
-- `register_leave` es `security definer` y devuelve el nuevo estado; el cliente puede mostrar inmediatamente "1/3 abandonos".
-- El decay también se ejecuta dentro de `register_leave` antes de incrementar, para que un jugador que vuelve tras >24h sin abandonar empiece a contar desde 0 incluso si no hay pg_cron.
-- Sin cambios en el sistema de moderación existente.
+**Modificat:**
+- `src/pages/admin/Moderacio.tsx` — reescriptura completa.
+- `src/pages/Ajustes.tsx` (o on hi hagi avui el link) — visibilitat condicional.
 
-## Archivos a crear / modificar
-- **Nuevo** `supabase/migrations/<ts>_leaver_penalty.sql`
-- **Nuevo** `src/online/useLeaverPenalty.ts`
-- Editar `src/components/OnlineBanGate.tsx` (añadir rama leaver)
-- Editar `src/i18n/dict.ts` (claves nuevas)
-- Editar `supabase/functions/rooms-rpc/index.ts` (llamar `register_leave` al abandonar partida en curso)
-- (Opcional) Editar `src/App.tsx` si el gate envuelve rutas no-online y conviene limitarlo
+## Passos manuals que demanaré a l'usuari
 
-## Preguntas antes de implementar
-1. **¿Cuándo cuenta exactamente como abandono?** Mi propuesta: salir de la sala o desconectarse >60s durante una partida ya iniciada (no en lobby, no al terminar). ¿OK o prefieres otro umbral?
-2. **¿Quieres que también se envíe un mensaje a la bandeja** cuando se activa el baneo, además del cartel del gate? (Recomendado: sí.)
-3. **pg_cron para el decay:** si no está habilitado en tu proyecto, ¿OK con la versión "decay oportunista al cargar"? (Funciona igual de bien para el usuario.)
+1. Executar la migració SQL a Supabase.
+2. Executar `insert into public.user_roles (user_id, role) values ('<el-teu-uuid>', 'admin');` amb el seu propi `auth.users.id` (li explico com trobar-lo a Authentication → Users).
+3. Recarregar l'app: el botó "Moderació" apareixerà automàticament.
+
+## Tècnic clau
+
+- Mai posar `role` a la taula `profiles` — sempre `user_roles` separada (evita escalada de privilegis).
+- `has_role` SECURITY DEFINER per evitar recursió RLS.
+- Tots els checks de rol al servidor; el frontend només amaga UI per UX.
+- `_authenticated/route.tsx` ja existeix i gestiona la sessió; aquesta pàgina viu sota `/admin/...` però fa el guard manualment amb `useMyRole` perquè l'estructura actual no la té sota `_authenticated`.
