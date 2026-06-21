@@ -28,6 +28,7 @@ import { AccountLinkSection } from "@/components/AccountLinkSection";
 import { ShareAppButton } from "@/components/ShareAppButton";
 import { EndGameOverlay } from "@/components/truc/EndGameOverlay";
 import type { PlayerId, TeamId } from "@/game/types";
+import { useMyRole } from "@/hooks/useMyRole";
 
 function Loading() {
   return (
@@ -51,6 +52,7 @@ function Ajustes() {
   const { settings, update, ready } = useGameSettings();
   const { deviceId, name, setName, ready: identityReady } = usePlayerIdentity();
   const { password: adminPassword, setPassword: setAdminPassword, ready: adminReady } = useAdminPassword();
+  const { isModerator, role } = useMyRole();
   const [previewEndGame, setPreviewEndGame] = useState<TeamId | null>(null);
   if (!ready || !identityReady || !adminReady) return <Loading />;
 
@@ -120,6 +122,18 @@ function Ajustes() {
             </Link>
           </Button>
           <AccountLinkSection />
+          {isModerator && (
+            <Button
+              asChild
+              variant="outline"
+              className="w-full justify-start border-amber-500/50 text-amber-600 hover:bg-amber-500/10 mt-2"
+            >
+              <Link to="/admin/moderacio">
+                <ShieldAlert className="w-4 h-4 mr-2" />
+                Panell de moderació ({role})
+              </Link>
+            </Button>
+          )}
         </Section>
 
         <Section title={t("settings.language")}>
