@@ -1,50 +1,42 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Loader2, LogOut, RefreshCw, ShieldCheck, ShieldX, Clock, MessageSquare, History } from "lucide-react";
+import {
+  Loader2,
+  LogOut,
+  RefreshCw,
+  ShieldCheck,
+  ShieldX,
+  Inbox,
+  History,
+  MessageSquare,
+  HandHeart,
+  AlertTriangle,
+  ShieldAlert,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { useAdminPassword } from "@/hooks/useAdminPassword";
+import { useAuth } from "@/hooks/useAuth";
+import { useMyRole } from "@/hooks/useMyRole";
 import { ShareAppButton } from "@/components/ShareAppButton";
 import {
-  adminListChatFlags,
-  adminDecideChatFlag,
-  adminListChatFlagAudit,
-  type AdminChatFlagDTO,
-  type ChatFlagStatus,
-  type AdminChatFlagAuditEntryDTO,
-} from "@/online/rooms.functions";
+  listInboxFlags,
+  listAuditEntries,
+  decideFlag,
+  type InboxFlag,
+  type AuditEntry,
+  type FlagDecision,
+  type FlagStatus,
+} from "@/online/moderationInbox";
 
-const FILTERS: { value: ChatFlagStatus | "all"; label: string }[] = [
+const TABS: { value: FlagStatus | "all"; label: string }[] = [
   { value: "pending", label: "Pendents" },
   { value: "approved", label: "Aprovats" },
   { value: "dismissed", label: "Desestimats" },
   { value: "all", label: "Tots" },
 ];
-
-function statusBadge(status: ChatFlagStatus) {
-  if (status === "pending") {
-    return (
-      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-amber-500/15 text-amber-600 border border-amber-500/30">
-        <Clock className="w-3 h-3" /> Pendent
-      </span>
-    );
-  }
-  if (status === "approved") {
-    return (
-      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-destructive/15 text-destructive border border-destructive/30">
-        <ShieldCheck className="w-3 h-3" /> Aprovat
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-500/15 text-emerald-600 border border-emerald-500/30">
-      <ShieldX className="w-3 h-3" /> Desestimat
-    </span>
-  );
-}
 
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
@@ -55,114 +47,101 @@ function formatDate(iso: string | null): string {
   }
 }
 
-function remainingLabel(expiresAt: string): string {
-  const ms = new Date(expiresAt).getTime() - Date.now();
-  if (ms <= 0) return "expirat";
-  const sec = Math.floor(ms / 1000);
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  return `${m}m ${s.toString().padStart(2, "0")}s restants`;
+function truncate(s: string, n = 14): string {
+  return s.length <= n ? s : `${s.slice(0, n)}…`;
+}
+
+function SourceBadge({ source }: { source: InboxFlag["source"] }) {
+  if (source === "local-blacklist") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-orange-500/15 text-orange-600 border border-orange-500/30">
+        Blacklist local
+      </span>
+    );
+  }
+  if (source === "openai-moderation") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-violet-500/15 text-violet-600 border border-violet-500/30">
+        OpenAI
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-slate-500/15 text-slate-600 border border-slate-500/30">
+      Jugador
+    </span>
+  );
+}
+
+function StatusBadge({ status }: { status: FlagStatus }) {
+  if (status === "pending")
+    return <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-600 border border-amber-500/30">Pendent</span>;
+  if (status === "approved")
+    return <span className="text-[10px] px-2 py-0.5 rounded bg-destructive/15 text-destructive border border-destructive/30">Aprovat</span>;
+  return <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-600 border border-emerald-500/30">Desestimat</span>;
 }
 
 export default function Moderacio() {
   const navigate = useNavigate();
-  const { password, setPassword, ready } = useAdminPassword();
-  const [draftPwd, setDraftPwd] = useState("");
-  const [filter, setFilter] = useState<ChatFlagStatus | "all">("pending");
-  const [flags, setFlags] = useState<AdminChatFlagDTO[]>([]);
+  const { user, ready: authReady } = useAuth();
+  const { role, isAdmin, isModerator, ready: roleReady } = useMyRole();
+
+  const [status, setStatus] = useState<FlagStatus | "all">("pending");
+  const [flags, setFlags] = useState<InboxFlag[]>([]);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingAudit, setLoadingAudit] = useState(false);
   const [working, setWorking] = useState<number | null>(null);
-  const [authError, setAuthError] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<number, string>>({});
-  const [auditOpen, setAuditOpen] = useState<Record<number, boolean>>({});
-  const [auditLoading, setAuditLoading] = useState<number | null>(null);
-  const [auditByFlag, setAuditByFlag] = useState<Record<number, AdminChatFlagAuditEntryDTO[]>>({});
 
   useEffect(() => {
     document.title = "Moderació · Truc Valencià";
   }, []);
 
+  // Route guard ------------------------------------------------------------
+  useEffect(() => {
+    if (!authReady || !roleReady) return;
+    if (!user || !isModerator) {
+      navigate("/", { replace: true });
+    }
+  }, [authReady, roleReady, user, isModerator, navigate]);
+
   const refresh = useCallback(async () => {
-    if (!password) return;
+    if (!isModerator) return;
     setLoading(true);
-    setAuthError(null);
     try {
-      const res = await adminListChatFlags({ data: { password, status: filter } });
-      setFlags(res.flags);
+      const list = await listInboxFlags(status);
+      setFlags(list);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setAuthError(msg);
-      if (/contrasenya/i.test(msg)) {
-        setPassword("");
-      }
+      toast.error(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, [password, filter, setPassword]);
+  }, [isModerator, status]);
+
+  const refreshAudit = useCallback(async () => {
+    if (!isModerator) return;
+    setLoadingAudit(true);
+    try {
+      const entries = await listAuditEntries();
+      setAudit(entries);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingAudit(false);
+    }
+  }, [isModerator]);
 
   useEffect(() => {
-    if (ready && password) void refresh();
-  }, [ready, password, filter, refresh]);
+    if (isModerator) void refresh();
+  }, [isModerator, refresh]);
 
-  // Auto-refresh pending list every 15s.
+  // Auto-refresh pendents cada 20s
   useEffect(() => {
-    if (!password || filter !== "pending") return;
-    const id = window.setInterval(() => { void refresh(); }, 15000);
+    if (!isModerator || status !== "pending") return;
+    const id = window.setInterval(() => { void refresh(); }, 20000);
     return () => window.clearInterval(id);
-  }, [password, filter, refresh]);
-
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmed = draftPwd.trim();
-    if (!trimmed) return;
-    setPassword(trimmed);
-    setDraftPwd("");
-  };
-
-  const handleDecide = async (flagId: number, decision: ChatFlagStatus) => {
-    setWorking(flagId);
-    try {
-      const res = await adminDecideChatFlag({
-        data: { password, flagId, decision, note: notes[flagId]?.trim() || undefined },
-      });
-      toast.success(
-        decision === "approved" ? "Flag aprovat — silenciament mantingut."
-        : decision === "dismissed" ? "Flag desestimat — silenciament aixecat."
-        : "Flag tornat a pendent.",
-      );
-      if (res.auditError) {
-        toast.warning(`Decisió aplicada però l'auditoria ha fallat: ${res.auditError}`);
-      }
-      // Invalidate cached audit so the new entry shows up next time it opens.
-      setAuditByFlag((prev) => {
-        const next = { ...prev };
-        delete next[flagId];
-        return next;
-      });
-      await refresh();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setWorking(null);
-    }
-  };
-
-  const toggleAudit = async (flagId: number) => {
-    const isOpen = !!auditOpen[flagId];
-    setAuditOpen((prev) => ({ ...prev, [flagId]: !isOpen }));
-    if (isOpen) return;
-    if (auditByFlag[flagId]) return;
-    setAuditLoading(flagId);
-    try {
-      const res = await adminListChatFlagAudit({ data: { password, flagId } });
-      setAuditByFlag((prev) => ({ ...prev, [flagId]: res.entries }));
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-      setAuditOpen((prev) => ({ ...prev, [flagId]: false }));
-    } finally {
-      setAuditLoading(null);
-    }
-  };
+  }, [isModerator, status, refresh]);
 
   const counts = useMemo(() => {
     const c = { pending: 0, approved: 0, dismissed: 0 };
@@ -170,7 +149,7 @@ export default function Moderacio() {
     return c;
   }, [flags]);
 
-  if (!ready) {
+  if (!authReady || !roleReady) {
     return (
       <main className="min-h-screen flex items-center justify-center">
         <Loader2 className="w-6 h-6 animate-spin text-primary" />
@@ -178,245 +157,276 @@ export default function Moderacio() {
     );
   }
 
-  if (!password) {
-    return (
-      <main className="min-h-screen px-5 py-8 bg-background text-foreground">
-        <div className="w-full max-w-md mx-auto flex flex-col gap-6">
-          <header className="flex items-center justify-between">
-            <h1 className="font-display font-black italic text-gold text-2xl">Moderació</h1>
-            <div className="flex items-center justify-between">
-              <ShareAppButton />
-              <Button onClick={() => navigate(-1)} size="sm" variant="outline" className="h-8 w-8 p-0" aria-label="Tornar">
-                <LogOut className="w-4 h-4" />
-              </Button>
-            </div>
-          </header>
-          <form onSubmit={handleLogin} className="flex flex-col gap-3 rounded-lg border border-primary/30 bg-card/40 p-4">
-            <Label htmlFor="pwd">Contrasenya d'administrador</Label>
-            <Input
-              id="pwd"
-              type="password"
-              autoComplete="current-password"
-              value={draftPwd}
-              onChange={(e) => setDraftPwd(e.target.value)}
-              placeholder="••••••••"
-            />
-            <Button type="submit" disabled={!draftPwd.trim()}>Entrar</Button>
-            {authError && <p className="text-xs text-destructive">{authError}</p>}
-          </form>
-        </div>
-      </main>
-    );
+  if (!user || !isModerator) {
+    // El useEffect ja redirigeix; aquest fallback evita parpadeig.
+    return null;
+  }
+
+  async function handleDecide(flag: InboxFlag, decision: FlagDecision) {
+    if (decision === "forgiven" && !isAdmin) {
+      toast.error("Només l'administrador pot perdonar punts.");
+      return;
+    }
+    setWorking(flag.id);
+    try {
+      const tag = user?.email ?? user?.id ?? "moderator";
+      const res = await decideFlag({
+        flag,
+        decision,
+        userId: user!.id,
+        moderatorTag: tag,
+        note: notes[flag.id]?.trim() || undefined,
+      });
+      const label =
+        decision === "approved" ? "Baneig aprovat — silenciament mantingut."
+        : decision === "forgiven" ? "Punts perdonats — flag arxivat."
+        : decision === "dismissed" ? "Flag desestimat."
+        : "Flag reobert.";
+      toast.success(label);
+      if (res.auditError) {
+        toast.warning(`Decisió aplicada però l'auditoria ha fallat: ${res.auditError}`);
+      }
+      await refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWorking(null);
+    }
   }
 
   return (
-    <main className="min-h-screen px-5 py-8 bg-background text-foreground">
+    <main className="min-h-screen px-4 py-6 bg-background text-foreground">
       <div className="w-full max-w-4xl mx-auto flex flex-col gap-5">
-        <header className="flex items-center justify-between gap-3">
-          <div>
-            <h1 className="font-display font-black italic text-gold text-2xl md:text-3xl">
-              Moderació · flags del xat
-            </h1>
-            <p className="text-xs text-muted-foreground mt-1">
-              Revisa els missatges silenciats. Aprovar manté el silenciament; desestimar el cancel·la i deixa el jugador escriure de nou.
-            </p>
+        <header className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-6 h-6 text-primary" />
+            <div>
+              <h1 className="font-display font-black italic text-gold text-2xl md:text-3xl leading-none">
+                Moderació
+              </h1>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Bandeja de reports de xat · rol:{" "}
+                <span className={cn(
+                  "font-medium",
+                  isAdmin ? "text-destructive" : "text-amber-600",
+                )}>
+                  {role}
+                </span>
+              </p>
+            </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button onClick={() => void refresh()} size="sm" variant="outline" disabled={loading} title="Actualitzar">
-              <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} />
-            </Button>
-            <Button
-              onClick={() => { setPassword(""); setFlags([]); }}
-              size="sm"
-              variant="ghost"
-              title="Sortir"
-            >
-              <LogOut className="w-4 h-4" />
+            <ShareAppButton />
+            <Button asChild size="sm" variant="ghost" title="Tornar">
+              <Link to="/"><LogOut className="w-4 h-4" /></Link>
             </Button>
           </div>
         </header>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {FILTERS.map((f) => (
-            <button
-              key={f.value}
-              type="button"
-              onClick={() => setFilter(f.value)}
-              className={cn(
-                "h-8 px-3 rounded-md text-xs font-medium border transition-colors",
-                filter === f.value
-                  ? "bg-primary text-primary-foreground border-primary"
-                  : "bg-background border-border hover:bg-muted",
+        <Tabs defaultValue="inbox" className="w-full">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="inbox" className="gap-1.5">
+              <Inbox className="w-4 h-4" /> Alertes actives
+              {counts.pending > 0 && (
+                <span className="ml-1 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-destructive text-[10px] text-destructive-foreground">
+                  {counts.pending}
+                </span>
               )}
-            >
-              {f.label}
-              {f.value !== "all" && counts[f.value] > 0 && (
-                <span className="ml-1.5 opacity-80">({counts[f.value]})</span>
-              )}
-            </button>
-          ))}
-          <span className="ml-auto text-xs text-muted-foreground">
-            {flags.length} flag{flags.length === 1 ? "" : "s"}
-          </span>
-        </div>
+            </TabsTrigger>
+            <TabsTrigger value="audit" className="gap-1.5" onClick={() => void refreshAudit()}>
+              <History className="w-4 h-4" /> Historial
+            </TabsTrigger>
+          </TabsList>
 
-        {loading && flags.length === 0 ? (
-          <div className="flex items-center justify-center py-10">
-            <Loader2 className="w-5 h-5 animate-spin text-primary" />
-          </div>
-        ) : flags.length === 0 ? (
-          <p className="text-center text-sm text-muted-foreground py-10">
-            Cap flag {filter === "all" ? "" : `(${FILTERS.find((f) => f.value === filter)?.label.toLowerCase()})`}.
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-3">
-            {flags.map((f) => {
-              const isPending = f.status === "pending";
-              const isWorking = working === f.id;
-              return (
-                <li
-                  key={f.id}
+          {/* === INBOX ============================================== */}
+          <TabsContent value="inbox" className="mt-4 flex flex-col gap-4">
+            <div className="flex flex-wrap items-center gap-2">
+              {TABS.map((t) => (
+                <button
+                  key={t.value}
+                  type="button"
+                  onClick={() => setStatus(t.value)}
                   className={cn(
-                    "rounded-lg border p-3 flex flex-col gap-2",
-                    isPending ? "border-amber-500/40 bg-amber-500/5" : "border-border bg-card/40",
+                    "h-8 px-3 rounded-md text-xs font-medium border transition-colors",
+                    status === t.value
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-background border-border hover:bg-muted",
                   )}
                 >
-                  <div className="flex items-start justify-between gap-2 flex-wrap">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      {statusBadge(f.status)}
-                      <span className="text-xs text-muted-foreground">
-                        Sala <span className="font-mono">{f.roomCode}</span>
-                      </span>
-                      <span className="text-xs text-muted-foreground">·</span>
-                      <span className="text-xs text-muted-foreground">{formatDate(f.createdAt)}</span>
-                    </div>
-                    <span className="text-[11px] text-muted-foreground">
-                      {remainingLabel(f.expiresAt)}
-                    </span>
-                  </div>
+                  {t.label}
+                </button>
+              ))}
+              <span className="ml-auto text-xs text-muted-foreground">
+                {flags.length} flag{flags.length === 1 ? "" : "s"}
+              </span>
+              <Button onClick={() => void refresh()} size="sm" variant="outline" disabled={loading}>
+                <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} />
+              </Button>
+            </div>
 
-                  <div className="text-sm">
-                    <span className="font-semibold text-destructive">{f.targetName}</span>
-                    <span className="text-muted-foreground"> reportat per </span>
-                    <span className="font-medium">{f.reporterName}</span>
-                  </div>
-
-                  {f.messageText ? (
-                    <div className="rounded-md bg-background/60 border border-border/60 p-2 text-sm flex items-start gap-2">
-                      <MessageSquare className="w-3.5 h-3.5 mt-0.5 text-muted-foreground shrink-0" />
-                      <p className="break-words italic">"{f.messageText}"</p>
-                    </div>
-                  ) : (
-                    <p className="text-xs text-muted-foreground italic">
-                      (Sense missatge concret — report genèric)
-                    </p>
-                  )}
-
-                  {f.reason && (
-                    <p className="text-xs text-muted-foreground">
-                      <span className="font-medium">Motiu:</span> {f.reason}
-                    </p>
-                  )}
-
-                  {!isPending && (
-                    <p className="text-[11px] text-muted-foreground">
-                      Decidit {formatDate(f.decidedAt)} per {f.decidedBy ?? "admin"}
-                    </p>
-                  )}
-
-                  <Input
-                    value={notes[f.id] ?? ""}
-                    onChange={(e) => setNotes((prev) => ({ ...prev, [f.id]: e.target.value.slice(0, 500) }))}
-                    placeholder="Nota interna del moderador (opcional, queda al registre d'auditoria)"
-                    disabled={isWorking}
-                    className="h-8 text-xs"
-                    aria-label={`Nota del moderador per al flag ${f.id}`}
-                    maxLength={500}
-                  />
-
-                  <div className="flex items-center gap-2 pt-1 flex-wrap">
-                    {f.status !== "approved" && (
-                      <Button
-                        size="sm"
-                        variant="destructive"
-                        disabled={isWorking}
-                        onClick={() => void handleDecide(f.id, "approved")}
-                      >
-                        <ShieldCheck className="w-3.5 h-3.5 mr-1" /> Aprovar
-                      </Button>
-                    )}
-                    {f.status !== "dismissed" && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={isWorking}
-                        onClick={() => void handleDecide(f.id, "dismissed")}
-                      >
-                        <ShieldX className="w-3.5 h-3.5 mr-1" /> Desestimar
-                      </Button>
-                    )}
-                    {!isPending && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={isWorking}
-                        onClick={() => void handleDecide(f.id, "pending")}
-                      >
-                        Reobrir
-                      </Button>
-                    )}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={isWorking || auditLoading === f.id}
-                      onClick={() => void toggleAudit(f.id)}
-                    >
-                      <History className="w-3.5 h-3.5 mr-1" />
-                      {auditOpen[f.id] ? "Amagar historial" : "Historial"}
-                    </Button>
-                    <Link
-                      to={`/online/sala/${encodeURIComponent(f.roomCode)}`}
-                      className="ml-auto text-xs text-primary hover:underline"
-                    >
-                      Veure sala
-                    </Link>
-                  </div>
-
-                  {auditOpen[f.id] && (
-                    <div className="mt-1 rounded-md border border-border/60 bg-background/60 p-2 text-xs space-y-1">
-                      {auditLoading === f.id ? (
-                        <p className="text-muted-foreground italic flex items-center gap-1">
-                          <Loader2 className="w-3 h-3 animate-spin" /> Carregant historial…
-                        </p>
-                      ) : (auditByFlag[f.id] ?? []).length === 0 ? (
-                        <p className="text-muted-foreground italic">Sense decisions registrades per a aquest flag.</p>
-                      ) : (
-                        <ol className="space-y-1 list-decimal list-inside">
-                          {(auditByFlag[f.id] ?? []).map((a) => (
-                            <li key={a.id} className="leading-snug">
-                              <span className="font-medium">{formatDate(a.decidedAt)}</span>
-                              {" · "}
-                              <span className={cn(
-                                a.decision === "approved" && "text-destructive font-medium",
-                                a.decision === "dismissed" && "text-emerald-600 font-medium",
-                                a.decision === "pending" && "text-amber-600 font-medium",
-                              )}>{a.decision}</span>
-                              {" per "}
-                              <span className="font-mono">{a.moderatorTag}</span>
-                              {a.reason && (
-                                <span className="text-muted-foreground"> — {a.reason}</span>
-                              )}
-                            </li>
-                          ))}
-                        </ol>
+            {loading && flags.length === 0 ? (
+              <div className="flex justify-center py-10"><Loader2 className="w-5 h-5 animate-spin text-primary" /></div>
+            ) : flags.length === 0 ? (
+              <p className="text-center text-sm text-muted-foreground py-10">
+                Cap alerta {status === "all" ? "" : `(${TABS.find((t) => t.value === status)?.label.toLowerCase()})`}.
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-3">
+                {flags.map((f) => {
+                  const isWorking = working === f.id;
+                  const isSevere = f.weight >= 2;
+                  return (
+                    <li
+                      key={f.id}
+                      className={cn(
+                        "rounded-lg border p-3 flex flex-col gap-2 shadow-sm",
+                        f.status === "pending"
+                          ? isSevere
+                            ? "border-destructive/50 bg-destructive/5"
+                            : "border-orange-500/40 bg-orange-500/5"
+                          : "border-border bg-card/40",
                       )}
+                    >
+                      <div className="flex items-start justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <StatusBadge status={f.status} />
+                          <SourceBadge source={f.source} />
+                          <span className={cn(
+                            "text-[10px] px-2 py-0.5 rounded border",
+                            isSevere
+                              ? "bg-destructive/10 text-destructive border-destructive/30"
+                              : "bg-amber-500/10 text-amber-700 border-amber-500/30",
+                          )}>
+                            {f.reason ?? "sense motiu"} · pes {f.weight}
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-muted-foreground">{formatDate(f.createdAt)}</span>
+                      </div>
+
+                      {f.messageText ? (
+                        <div className={cn(
+                          "rounded-md p-2 border flex items-start gap-2",
+                          isSevere
+                            ? "bg-destructive/10 border-destructive/30 text-destructive"
+                            : "bg-orange-500/10 border-orange-500/30 text-orange-800 dark:text-orange-300",
+                        )}>
+                          {isSevere
+                            ? <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                            : <MessageSquare className="w-4 h-4 mt-0.5 shrink-0" />}
+                          <p className="text-sm font-medium break-words italic">"{f.messageText}"</p>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground italic">(sense missatge concret)</p>
+                      )}
+
+                      <div className="text-xs text-muted-foreground flex flex-wrap gap-x-3 gap-y-1">
+                        <span>
+                          <span className="font-medium text-foreground/80">Infractor:</span>{" "}
+                          <code className="text-[11px]">{truncate(f.targetDeviceId, 18)}</code>
+                        </span>
+                        <span>
+                          <span className="font-medium text-foreground/80">Sala:</span>{" "}
+                          <code className="text-[11px]">{truncate(f.roomId, 8)}</code>
+                        </span>
+                        {f.decidedAt && (
+                          <span>Decidit {formatDate(f.decidedAt)}</span>
+                        )}
+                      </div>
+
+                      {f.status === "pending" && (
+                        <Input
+                          value={notes[f.id] ?? ""}
+                          onChange={(e) => setNotes((p) => ({ ...p, [f.id]: e.target.value.slice(0, 500) }))}
+                          placeholder="Nota interna (opcional)"
+                          disabled={isWorking}
+                          className="h-8 text-xs"
+                          maxLength={500}
+                        />
+                      )}
+
+                      <div className="flex items-center gap-2 pt-1 flex-wrap">
+                        {f.status !== "approved" && (
+                          <Button size="sm" variant="destructive" disabled={isWorking}
+                            onClick={() => void handleDecide(f, "approved")}>
+                            <ShieldCheck className="w-3.5 h-3.5 mr-1" /> Aprovar baneig
+                          </Button>
+                        )}
+                        {f.status !== "dismissed" && (
+                          <Button size="sm" variant="outline" disabled={isWorking}
+                            onClick={() => void handleDecide(f, "dismissed")}>
+                            <ShieldX className="w-3.5 h-3.5 mr-1" /> Desestimar
+                          </Button>
+                        )}
+                        {isAdmin && f.status !== "dismissed" && (
+                          <Button size="sm" variant="ghost" disabled={isWorking}
+                            className="text-emerald-600 hover:text-emerald-700 hover:bg-emerald-500/10"
+                            onClick={() => void handleDecide(f, "forgiven")}>
+                            <HandHeart className="w-3.5 h-3.5 mr-1" /> Perdonar punts
+                          </Button>
+                        )}
+                        {f.status !== "pending" && (
+                          <Button size="sm" variant="ghost" disabled={isWorking}
+                            onClick={() => void handleDecide(f, "pending")}>
+                            Reobrir
+                          </Button>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </TabsContent>
+
+          {/* === AUDIT ============================================== */}
+          <TabsContent value="audit" className="mt-4 flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-muted-foreground">
+                Historial de decisions de moderació ({audit.length} entrades)
+              </p>
+              <Button onClick={() => void refreshAudit()} size="sm" variant="outline" disabled={loadingAudit}>
+                <RefreshCw className={cn("w-4 h-4", loadingAudit && "animate-spin")} />
+              </Button>
+            </div>
+            {loadingAudit && audit.length === 0 ? (
+              <div className="flex justify-center py-10"><Loader2 className="w-5 h-5 animate-spin text-primary" /></div>
+            ) : audit.length === 0 ? (
+              <p className="text-center text-sm text-muted-foreground py-10">
+                Cap decisió registrada encara.
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-2">
+                {audit.map((a) => (
+                  <li key={a.id} className="rounded-md border border-border bg-card/40 p-2.5 text-sm flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className={cn(
+                        "text-[11px] font-semibold px-2 py-0.5 rounded",
+                        a.decision === "approved" && "bg-destructive/15 text-destructive",
+                        a.decision === "dismissed" && "bg-emerald-500/15 text-emerald-600",
+                        a.decision === "forgiven" && "bg-blue-500/15 text-blue-600",
+                        a.decision === "pending" && "bg-amber-500/15 text-amber-600",
+                      )}>
+                        {a.decision}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground">{formatDate(a.decidedAt)}</span>
                     </div>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        )}
+                    {a.messageText && (
+                      <p className="text-xs italic break-words">"{a.messageText}"</p>
+                    )}
+                    <div className="text-[11px] text-muted-foreground flex flex-wrap gap-x-3">
+                      <span>flag #{a.flagId}</span>
+                      {a.reason && <span>motiu: {a.reason}</span>}
+                      {a.moderatorTag && <span>per: <code>{truncate(a.moderatorTag, 24)}</code></span>}
+                    </div>
+                    {a.moderatorNote && (
+                      <p className="text-[11px] text-foreground/80">📝 {a.moderatorNote}</p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </TabsContent>
+        </Tabs>
       </div>
     </main>
   );
